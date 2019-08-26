@@ -1,0 +1,322 @@
+---
+layout:     post
+title:      "K8S搭建Calico（BGP）网络测试环境"
+subtitle:   "仅仅为了学习，娱乐而已"
+date:       2019-08-26
+author:     "Ray"
+header-img: "img/about-bg-walle.jpg"
+catalog: true
+tags:
+  - 笔记
+  - K8S
+  - Calico
+  - BGP
+---
+
+### 前言
+本文的主要是目的是通过K8S搭建一套leaf spine的网络模拟环境，来进行Calico网络方案的测试及验证。之前这个环境是通过KVM虚拟机来搭建的，目前转到了K8S平台，这记录一下部署过程，以防老年痴呆。 
+
+### 网络拓扑
+这里的网络节点是通过在Ubuntu环境部署frr模拟网络设备： 
+```
+                           +-----+
+                           |test1|
+                           +--+--+
+                              |
+                         +----+-----+
+                         |          |
+                       +-+--+    +--+-+
+                       | BL |    | BL |
+                       | 01 |    | 02 |
+                       +-+--+    +--+-+
+                         |          |
+   +----------+---------------------+
+   |          |          |          |
++--+--+    +--+--+    +--+--+    +--+--+
+|Spine|    |Spine|    |Spine|    |Spine|
+| 01  |    | 02  |    | 03  |    | 04  |
++--+--+    +--+--+    +--+--+    +--+--+
+   |          |          |          |
+   +--------------------------------+
+   |          |          |          |
++--+--+    +--+--+    +--+--+    +--+--+
+| Tor |    | Tor |    | Tor |    | Tor |
+| 01  |    | 02  |    | 03  |    | 04  |
++--+--+    +-----+    +-----+    +--+--+
+   |                                |
+   |                                |
++--+--+                          +--+--+
+|test2|                          |test3|
++-----+                          +-----+
+
+```
+### 制作基础镜像
+#### 下载ubuntu基础镜像
+```
+# download the latest ubuntu image 
+docker pull ubuntu
+
+# run --privileged=true and install some base tools  
+docker run -it --privileged=true  --name myubuntu -d  ubuntu  
+
+apt update && apt-get install lsb-core vim curl wget iputils-ping
+```
+
+#### 安装FRR
+```
+# add GPG key
+curl -s https://deb.frrouting.org/frr/keys.asc | sudo apt-key add -
+
+# possible values for FRRVER: frr-6 frr-7 frr-stable
+# frr-stable will be the latest official stable release
+FRRVER="frr-stable"
+echo deb https://deb.frrouting.org/frr $(lsb_release -s -c) $FRRVER | sudo tee -a /etc/apt/sources.list.d/frr.list
+
+# update and install FRR
+sudo apt update && sudo apt install frr frr-pythontools
+
+# start 
+/etc/init.d/frr   start 
+```
+
+#### 保存镜像
+```
+docker commit  myubuntu ubuntu18.04  
+docker save   -o ubuntu18.04.tar ubuntu18.04:latest 
+
+# on other node host load and test 
+docker load -i ubuntu18.04.tar
+docker run -it --privileged=true  --name myubuntu -d  ubuntu18.04 
+
+```
+### K8S平台启动
+由于我的K8S环境网络插件使用calico，只能提供三层的网络环境，因此需要增加一个额外的网络平面，提供一个二层的环境；为了方便配置，我将所有相关的POD调度到了一台机器上面。
+
+#### 配置POD
+为了方便管理，这里采用静态IP地址，因此在yaml文件里面直接增加annotations。另外，由于这里相当于拿POD做VM来使用，需要注意增加privileged权限，以及增加一些command args，来启动相关POD。
+
+```
+# cat tor-01.yaml
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tor-01
+  namespace: bgp
+  labels:
+    app: tor
+  annotations:
+    cni.projectcalico.org/ipAddrs: "[\"111.111.78.151\"]"
+spec:
+  nodeName: testvm-deploy1
+  containers:
+  - name: myapp-container
+    securityContext:
+      privileged: true
+    image: ubuntu18.04
+    imagePullPolicy: IfNotPresent
+    command: [ "/bin/bash", "-c", "--" ]
+    args: [ "while true; do sleep 30; done;" ]
+
+```
+
+#### 增加网络端口
+我们这里是需要模拟一个leaf spine的环境，tor spine之间的链路通过一个bridge的'总线'实现，即主机侧的端口统一放在一个bridge里面，然后在POD容器侧配置不同的三层地址，
+
+例如
+主机侧配置：
+```
+# brctl show  br0
+bridge name	bridge id		STP enabled	interfaces
+br0		8000.0238b5f7182d	no		vpl10433
+							vpl32290
+							vpl32667
+							vpl4580
+							vpl4982
+							vpl5296
+							vpl5618
+							vpl602
+							vpl6171
+							vpl6581
+							vpl7189
+							vpl7523
+							vpl7931
+#
+```
+
+POD容器侧网络配置信息：
+
+```
+# ip ad
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+2: tunl0@NONE: <NOARP> mtu 1480 qdisc noop state DOWN group default qlen 1000
+    link/ipip 0.0.0.0 brd 0.0.0.0
+4: eth0@if196: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default
+    link/ether a2:b2:34:09:f2:60 brd ff:ff:ff:ff:ff:ff link-netnsid 0
+    inet 111.111.78.151/32 scope global eth0
+       valid_lft forever preferred_lft forever
+238: vpg4580@if239: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default qlen 1000
+    link/ether d6:c5:f3:86:51:c6 brd ff:ff:ff:ff:ff:ff link-netnsid 0
+    inet 10.0.0.1/32 scope global vpg4580
+       valid_lft forever preferred_lft forever
+    inet 10.0.12.2/30 scope global vpg4580
+       valid_lft forever preferred_lft forever
+    inet 10.0.13.2/30 scope global vpg4580
+       valid_lft forever preferred_lft forever
+    inet 10.0.14.2/30 scope global vpg4580
+       valid_lft forever preferred_lft forever
+    inet 2.2.2.2/24 scope global vpg4580
+       valid_lft forever preferred_lft forever
+    inet 10.0.15.1/24 scope global vpg4580
+       valid_lft forever preferred_lft forever
+    inet 10.0.11.2/30 scope global vpg4580
+       valid_lft forever preferred_lft forever
+#
+
+```
+
+写了一个简单的脚本，为每个POD增加一个veth类型网络端口
+
+```
+
+#!/bin/sh
+## write by Ray, any idea could mail to rayrenxiang@gmail.com 
+
+set -e
+
+##Usage##
+# ./add-ports.sh <bridge name> <docker name> [pod interface id or name]
+####### agrs ######
+IFNAME=$1
+GUESTNAME=$2
+CONTAINER_IFNAME=$3
+MTU=1500
+
+DOCKERPID=$(docker inspect --format='{{ .State.Pid }}' $GUESTNAME)
+NSPID=$DOCKERPID
+
+[ ! -d /var/run/netns ] && mkdir -p /var/run/netns
+rm -f "/var/run/netns/$NSPID"
+ln -s "/proc/$NSPID/ns/net" "/var/run/netns/$NSPID"
+
+LOCAL_IFNAME="v${CONTAINER_IFNAME}pl${NSPID}"
+GUEST_IFNAME="v${CONTAINER_IFNAME}pg${NSPID}"
+
+if ip link show "$LOCAL_IFNAME" >/dev/null 2>&1; then
+  # link exists, is it in use?
+  if ip link show "$LOCAL_IFNAME" up | grep -q "UP"; then
+    echo "Link $LOCAL_IFNAME exists and is up"
+    exit 1
+  fi
+# delete the link so we can re-add it afterwards
+ip link del "$LOCAL_IFNAME"
+fi
+
+ip link add name "$LOCAL_IFNAME" mtu "$MTU" type veth peer name "$GUEST_IFNAME" mtu "$MTU"
+ip link set "$LOCAL_IFNAME" up
+
+ip link set $GUEST_IFNAME netns $NSPID
+ip netns exec $NSPID ip link set $GUEST_IFNAME up
+brctl addif "$IFNAME" "$LOCAL_IFNAME"
+
+rm -f "/var/run/netns/$NSPID"
+
+```
+
+一些额外的配置：
+开启forwarding 
+
+```
+ysctl  -w net.ipv4.conf.all.forwarding=1
+```
+
+关闭icmp redirect 
+```
+sysctl  -w net.ipv4.conf.all.accept_redirects=0
+sysctl  -w net.ipv4.conf.default.accept_redirects=0 
+```
+如果想确认路由是否是icmp redirect生成的
+```
+# ip route get 10.0.65.100
+10.0.65.100 via 10.0.44.1 dev vpg602 src 10.0.45.100
+    cache <redirected> expires 293sec
+```
+
+#### 检查确认
+```
+# kubectl  get pod -n bgp
+NAME       READY   STATUS    RESTARTS   AGE
+bl-01      1/1     Running   0          3d4h
+bl-02      1/1     Running   0          3d4h
+spine-01   1/1     Running   0          3d4h
+spine-02   1/1     Running   0          3d4h
+spine-03   1/1     Running   0          3d4h
+spine-04   1/1     Running   0          3d4h
+test-01    1/1     Running   0          3d4h
+test-02    1/1     Running   0          3d4h
+test-03    1/1     Running   0          3d4h
+tor-01     1/1     Running   0          3d4h
+tor-02     1/1     Running   0          3d4h
+tor-03     1/1     Running   0          3d4h
+tor-04     1/1     Running   0          3d4h
+```
+
+
+#### FRR 配置
+
+关于FRR的配置可以直接参考Cisco的技术文档 
+这里可以贴一个实例
+```
+!
+router bgp 65001
+ bgp router-id 10.0.0.11
+ neighbor 10.0.11.2 remote-as 65000
+ neighbor 10.0.21.2 remote-as 65000
+ neighbor 10.0.31.2 remote-as 65000
+ neighbor 10.0.41.2 remote-as 65000
+ neighbor 10.0.51.2 remote-as 65500
+ neighbor 10.0.61.2 remote-as 65500
+ !
+ address-family ipv4 unicast
+  network 10.0.0.11/32
+  network 10.0.11.0/30
+  network 10.0.21.0/30
+  network 10.0.31.0/30
+  network 10.0.41.0/30
+  neighbor 10.0.11.2 as-override
+  neighbor 10.0.11.2 soft-reconfiguration inbound
+  neighbor 10.0.21.2 as-override
+  neighbor 10.0.21.2 soft-reconfiguration inbound
+  neighbor 10.0.31.2 as-override
+  neighbor 10.0.31.2 soft-reconfiguration inbound
+  neighbor 10.0.41.2 as-override
+  neighbor 10.0.41.2 soft-reconfiguration inbound
+  neighbor 10.0.51.2 soft-reconfiguration inbound
+  neighbor 10.0.61.2 soft-reconfiguration inbound
+ exit-address-family
+!
+
+# show bgp summary
+
+IPv4 Unicast Summary:
+BGP router identifier 10.0.0.11, local AS number 65001 vrf-id 0
+BGP table version 48
+RIB entries 73, using 11 KiB of memory
+Peers 6, using 124 KiB of memory
+
+Neighbor        V         AS MsgRcvd MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd
+10.0.11.2       4      65000     473     481        0    0    0 02:02:54            6
+10.0.21.2       4      65000     448     450        0    0    0 06:58:10            5
+10.0.31.2       4      65000     444     442        0    0    0 06:54:33            5
+10.0.41.2       4      65000     432     425        0    0    0 06:41:49            6
+10.0.51.2       4      65500     293     293        0    0    0 04:36:09            5
+10.0.61.2       4      65500     280     282        0    0    0 04:27:52            6
+
+Total number of neighbors 6
+```
+
+
+
