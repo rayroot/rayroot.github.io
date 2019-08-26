@@ -7,10 +7,10 @@ author:     "Ray"
 header-img: "img/about-bg-walle.jpg"
 catalog: true
 tags:
-  - 笔记
   - K8S
   - Calico
   - BGP
+  - FRR
 ---
 
 ### 前言
