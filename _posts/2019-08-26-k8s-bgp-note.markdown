@@ -318,5 +318,7 @@ Neighbor        V         AS MsgRcvd MsgSent   TblVer  InQ OutQ  Up/Down State/P
 Total number of neighbors 6
 ```
 
+[相关配置文件](https://github.com/rayroot/rayroot.github.io/tree/master/data/frr-bgp)
+
 
 
